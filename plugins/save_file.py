@@ -42,8 +42,7 @@ YT_DLP_PROGRESS_RE = re.compile(
     r"\[download\]\s+(?P<pct>\d+(?:\.\d+)?)%.*?of\s+(?P<size>.+?)(?:\s+at\s+(?P<speed>.+?))?(?:\s+ETA\s+(?P<eta>\S+))?$",
     re.IGNORECASE,
 )
-DM_AUDIO_RE = re.compile(r'GROUP-ID="(?P<group>[^"]+)".*?(?:DEFAULT=(?P<default>YES|NO)).*?URI="(?P<uri>[^"]+)"')
-DM_STREAM_RE = re.compile(r'BANDWIDTH=(?P<bandwidth>\d+).*?(?:RESOLUTION=(?P<resolution>\d+x\d+))?.*?(?:AUDIO="(?P<audio>[^"]+)")?')
+DM_ATTR_RE = re.compile(r'([A-Z0-9-]+)=("([^"]*)"|[^,]+)')
 
 
 def _safe_filename(name: str) -> str:
@@ -215,24 +214,26 @@ def _pick_best_dm_stream(master_manifest: str):
             continue
 
         if line.startswith("#EXT-X-MEDIA:TYPE=AUDIO"):
-            match = DM_AUDIO_RE.search(line)
-            if match:
-                group = match.group("group")
+            attrs = _parse_hls_attrs(line.split(":", 1)[1])
+            group = attrs.get("GROUP-ID")
+            uri = attrs.get("URI")
+            if group and uri:
                 audio_groups.setdefault(group, []).append(
                     {
-                        "uri": match.group("uri"),
-                        "default": match.group("default") == "YES",
+                        "uri": uri,
+                        "default": attrs.get("DEFAULT") == "YES",
                     }
                 )
             continue
 
         if line.startswith("#EXT-X-STREAM-INF:"):
-            match = DM_STREAM_RE.search(line)
-            if match:
+            attrs = _parse_hls_attrs(line.split(":", 1)[1])
+            bandwidth = attrs.get("BANDWIDTH")
+            if bandwidth:
                 pending_stream = {
-                    "bandwidth": int(match.group("bandwidth")),
-                    "resolution": match.group("resolution"),
-                    "audio_group": match.group("audio"),
+                    "bandwidth": int(bandwidth),
+                    "resolution": attrs.get("RESOLUTION"),
+                    "audio_group": attrs.get("AUDIO"),
                 }
             else:
                 pending_stream = None
@@ -259,6 +260,15 @@ def _pick_best_dm_stream(master_manifest: str):
             audio_url = preferred["uri"]
 
     return best_variant["video_url"], audio_url
+
+
+def _parse_hls_attrs(attr_text: str):
+    attrs = {}
+    for match in DM_ATTR_RE.finditer(attr_text):
+        key = match.group(1)
+        value = match.group(3) if match.group(3) is not None else match.group(2)
+        attrs[key] = value.strip('"')
+    return attrs
 
 
 def _build_unique_output_path(dest_dir: str, title: str, video_id: str):
