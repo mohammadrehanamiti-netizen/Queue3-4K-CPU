@@ -9,6 +9,10 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
+try:
+    from curl_cffi import requests as curl_requests
+except Exception:
+    curl_requests = None
 
 from chat import Chat
 from config import Config
@@ -38,6 +42,8 @@ YT_DLP_PROGRESS_RE = re.compile(
     r"\[download\]\s+(?P<pct>\d+(?:\.\d+)?)%.*?of\s+(?P<size>.+?)(?:\s+at\s+(?P<speed>.+?))?(?:\s+ETA\s+(?P<eta>\S+))?$",
     re.IGNORECASE,
 )
+DM_AUDIO_RE = re.compile(r'GROUP-ID="(?P<group>[^"]+)".*?(?:DEFAULT=(?P<default>YES|NO)).*?URI="(?P<uri>[^"]+)"')
+DM_STREAM_RE = re.compile(r'BANDWIDTH=(?P<bandwidth>\d+).*?(?:RESOLUTION=(?P<resolution>\d+x\d+))?.*?(?:AUDIO="(?P<audio>[^"]+)")?')
 
 
 def _safe_filename(name: str) -> str:
@@ -198,6 +204,154 @@ async def _download_dailymotion_with_ytdlp(url: str, dest_dir: str, status_msg, 
     return os.path.basename(final_path)
 
 
+def _pick_best_dm_stream(master_manifest: str):
+    audio_groups = {}
+    best_variant = None
+    pending_stream = None
+
+    for raw_line in master_manifest.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("#EXT-X-MEDIA:TYPE=AUDIO"):
+            match = DM_AUDIO_RE.search(line)
+            if match:
+                group = match.group("group")
+                audio_groups.setdefault(group, []).append(
+                    {
+                        "uri": match.group("uri"),
+                        "default": match.group("default") == "YES",
+                    }
+                )
+            continue
+
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            match = DM_STREAM_RE.search(line)
+            if match:
+                pending_stream = {
+                    "bandwidth": int(match.group("bandwidth")),
+                    "resolution": match.group("resolution"),
+                    "audio_group": match.group("audio"),
+                }
+            else:
+                pending_stream = None
+            continue
+
+        if pending_stream and line.startswith("http"):
+            candidate = pending_stream | {"video_url": line}
+            if best_variant is None or candidate["bandwidth"] > best_variant["bandwidth"]:
+                best_variant = candidate
+            pending_stream = None
+
+    if best_variant is None:
+        raise RuntimeError("Could not find any playable Dailymotion streams in the master playlist.")
+
+    audio_url = None
+    audio_group = best_variant.get("audio_group")
+    if audio_group and audio_group in audio_groups:
+        preferred = next((item for item in audio_groups[audio_group] if item["default"]), audio_groups[audio_group][0])
+        audio_url = preferred["uri"]
+    elif audio_groups:
+        first_group = next(iter(audio_groups.values()))
+        if first_group:
+            preferred = next((item for item in first_group if item["default"]), first_group[0])
+            audio_url = preferred["uri"]
+
+    return best_variant["video_url"], audio_url
+
+
+def _build_unique_output_path(dest_dir: str, title: str, video_id: str):
+    base = _safe_filename(title or f"dailymotion_{video_id}")[:180].strip(" .") or f"dailymotion_{video_id}"
+    filename = f"{base} [{video_id}].mp4"
+    full_path = os.path.join(dest_dir, filename)
+    if not os.path.exists(full_path):
+        return full_path
+    return os.path.join(dest_dir, f"{base} [{video_id}]_{uuid.uuid4().hex[:6]}.mp4")
+
+
+async def _download_dailymotion_via_browser_manifest(url: str, dest_dir: str, status_msg, job_id: str):
+    if curl_requests is None:
+        raise RuntimeError("curl_cffi is not installed, so the Dailymotion browser fallback is unavailable.")
+
+    os.makedirs(dest_dir, exist_ok=True)
+    headers = {
+        "Referer": "https://www.dailymotion.com/",
+        "Origin": "https://www.dailymotion.com",
+    }
+    _, normalized_url = build_ytdlp_base_command(url)
+    video_id = normalized_url.rstrip("/").split("/")[-1]
+    metadata_url = f"https://www.dailymotion.com/player/metadata/video/{video_id}?embedder=https://www.dailymotion.com/"
+
+    await safe_edit_message(
+        status_msg,
+        (
+            "<b>Dailymotion fallback enabled...</b>\n\n"
+            "The normal extractor was blocked by Dailymotion, so the bot is switching to the player-manifest path."
+        ),
+        parse_mode=ParseMode.HTML,
+        force=True,
+    )
+
+    metadata_resp = curl_requests.get(metadata_url, timeout=30, headers=headers, impersonate="chrome")
+    metadata_resp.raise_for_status()
+    metadata = metadata_resp.json()
+
+    qualities = metadata.get("qualities") or {}
+    auto_entries = qualities.get("auto") or []
+    master_url = next((entry.get("url") for entry in auto_entries if entry.get("url")), None)
+    if not master_url:
+        raise RuntimeError("Dailymotion metadata did not include a master playlist URL.")
+
+    master_resp = curl_requests.get(master_url, timeout=30, headers=headers, impersonate="chrome")
+    master_resp.raise_for_status()
+    video_url, audio_url = _pick_best_dm_stream(master_resp.text)
+
+    output_path = _build_unique_output_path(dest_dir, metadata.get("title"), metadata.get("id") or video_id)
+
+    await safe_edit_message(
+        status_msg,
+        (
+            "<b>Downloading Dailymotion streams...</b>\n\n"
+            f"Job ID: <code>{job_id}</code>\n"
+            f"Video ID: <code>{metadata.get('id') or video_id}</code>\n"
+            "Merging the best video stream with its audio stream."
+        ),
+        parse_mode=ParseMode.HTML,
+        force=True,
+    )
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        video_url,
+    ]
+    if audio_url:
+        ffmpeg_cmd += ["-i", audio_url, "-map", "0:v:0", "-map", "1:a:0?"]
+    else:
+        ffmpeg_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+
+    ffmpeg_cmd += ["-c", "copy", "-movflags", "+faststart", "-y", output_path]
+
+    proc = await asyncio.create_subprocess_exec(
+        *ffmpeg_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+
+    if proc.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError(
+            "ffmpeg failed while downloading the Dailymotion audio/video streams.\n"
+            f"{stderr.decode(errors='ignore')[-1200:]}"
+        )
+
+    return os.path.basename(output_path)
+
+
 @Client.on_message(filters.document & check_user & filters.private)
 async def save_doc(client, message):
     chat_id = message.from_user.id
@@ -292,12 +446,21 @@ async def save_url(client, message):
         job_id = uuid.uuid4().hex[:8]
 
         if is_dailymotion_url(url):
-            saved_name = await _download_dailymotion_with_ytdlp(
-                url=url,
-                dest_dir=Config.DOWNLOAD_DIR,
-                status_msg=sent,
-                job_id=job_id,
-            )
+            try:
+                saved_name = await _download_dailymotion_with_ytdlp(
+                    url=url,
+                    dest_dir=Config.DOWNLOAD_DIR,
+                    status_msg=sent,
+                    job_id=job_id,
+                )
+            except Exception as dm_error:
+                logger.warning("yt-dlp Dailymotion download failed, trying browser-manifest fallback: %s", dm_error)
+                saved_name = await _download_dailymotion_via_browser_manifest(
+                    url=url,
+                    dest_dir=Config.DOWNLOAD_DIR,
+                    status_msg=sent,
+                    job_id=job_id,
+                )
         else:
             saved_name = await _download_http_with_progress(
                 url=url,
