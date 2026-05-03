@@ -1,7 +1,8 @@
 import os, time, re, uuid, asyncio, math, logging, shlex, json
 from config import Config
-from helper_func.message_utils import safe_edit_message
-from helper_func.source_utils import build_ytdlp_base_command
+from urllib.parse import urlparse
+from helper_func.message_editor import DEFAULT_PROGRESS_INTERVAL, safe_edit_message
+from helper_func.settings_manager import SettingsManager
 from pyrogram.enums import ParseMode
 
 logger = logging.getLogger("mux.ffmpeg")
@@ -90,9 +91,18 @@ async def _probe_duration(vid_path: str) -> float:
         # --- New yt-dlp logic for URLs ---
         logger.info("Probing duration for URL with yt-dlp: %s", vid_path)
         
-        yt_dlp_cmd_parts, normalized_url = build_ytdlp_base_command(vid_path)
-        yt_dlp_cmd_parts.insert(1, '--dump-json')
-        yt_dlp_cmd_parts.append(normalized_url)
+        host = urlparse(vid_path).hostname or ""
+        yt_dlp_cmd_parts = [
+            'yt-dlp',
+            '--dump-json',
+            '--no-warnings',
+        ]
+        
+        if "dmcdn.net" in host or "dailymotion.com" in host:
+            logger.info("Applying Dailymotion headers to yt-dlp probe")
+            yt_dlp_cmd_parts += ["--user-agent", "Mozilla/5.0", "--referer", "https.www.dailymotion.com"]
+        
+        yt_dlp_cmd_parts.append(vid_path)
         
         proc = await asyncio.create_subprocess_exec(
             *yt_dlp_cmd_parts,
@@ -174,7 +184,7 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
             except: speed_x = 0.0
 
         now = time.time()
-        if now - last_edit < 8:
+        if now - last_edit < DEFAULT_PROGRESS_INTERVAL:
             continue
         last_edit = now
 
@@ -203,7 +213,12 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
         if job_id in running_jobs:
             running_jobs[job_id]['progress'] = card
 
-        await safe_edit_message(msg, card, parse_mode=ParseMode.HTML, min_interval=8.0)
+        await safe_edit_message(
+            msg,
+            card,
+            parse_mode=ParseMode.HTML,
+            min_interval=DEFAULT_PROGRESS_INTERVAL,
+        )
 
     try:
         ff_log.flush()
@@ -228,10 +243,12 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, fi
 
     if is_url:
         # --- NEW: Download the video file first ---
-        await msg.edit(
+        await safe_edit_message(
+            msg,
             f"Downloading video for soft-mux (<code>{job_id}</code>)…\n"
             "This is required for -c copy.",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            force=True,
         )
         
         base = uuid.uuid4().hex[:8]
@@ -239,10 +256,15 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, fi
         temp_vid_path = os.path.join(Config.DOWNLOAD_DIR, temp_vid_file)
         temp_vid_to_delete = temp_vid_file # Mark for deletion
         
-        yt_dlp_cmd_parts, normalized_url = build_ytdlp_base_command(vid_path)
-
+        host = urlparse(vid_path).hostname or ""
+        yt_dlp_cmd_parts = ['yt-dlp']
+        
+        if "dmcdn.net" in host or "dailymotion.com" in host:
+            logger.info("Applying Dailymotion headers to yt-dlp download")
+            yt_dlp_cmd_parts += ["--user-agent", "Mozilla/5.0", "--referer", "https://www.dailymotion.com"]
+        
         # Add output format and URL
-        yt_dlp_cmd_parts += ['-o', temp_vid_path, normalized_url]
+        yt_dlp_cmd_parts += ['-o', temp_vid_path, vid_path]
         
         proc = await asyncio.create_subprocess_exec(
             *yt_dlp_cmd_parts,
@@ -256,10 +278,12 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, fi
         
         if proc.returncode != 0:
             logger.error("yt-dlp download for softmux failed: %s", stderr.decode(errors='ignore'))
-            await msg.edit(
+            await safe_edit_message(
+                msg,
                 f"❌ yt-dlp download failed for job <code>{job_id}</code>:\n"
                 f"<pre>{stderr.decode(errors='ignore')[-1000:]}</pre>",
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                force=True,
             )
             return False
         
@@ -278,7 +302,7 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, fi
         'ffmpeg', '-hide_banner', '-progress', 'pipe:2', '-nostats',
         '-i', vid_path, '-i', sub_path,
         '-map', '1:0', '-map', '0', '-disposition:s:0', 'default',
-        '-c:v', 'copy', '-c:a', 'copy', f'-c:s', sub_ext,
+        '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', f'-c:s', sub_ext,
         '-y', out_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
 
@@ -286,7 +310,12 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, fi
     waiter = asyncio.create_task(proc.wait())
     running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter], 'progress': 'Initializing...', 'filename': final_name}
 
-    await msg.edit(f"🔄 Soft-Mux started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort", parse_mode=ParseMode.HTML)
+    await safe_edit_message(
+        msg,
+        f"🔄 Soft-Mux started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort",
+        parse_mode=ParseMode.HTML,
+        force=True,
+    )
     await asyncio.wait([reader, waiter])
     
     full_stderr_lines = reader.result() or []
@@ -300,9 +329,11 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, fi
             logger.warning("Could not delete temp softmux file: %s", e)
 
     if proc.returncode == 0:
-        await msg.edit(
+        await safe_edit_message(
+            msg,
             f"✅ Soft-Mux `<code>{job_id}</code>` completed in {round(time.time()-start)}s",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            force=True,
         )
         await asyncio.sleep(2)
         return output
@@ -319,10 +350,12 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, fi
         logger.error("Soft-mux failed for job %s — tail: %s", job_id, full_stderr_text[-1500:])
         err_preview = full_stderr_text[-1000:]
         
-        await msg.edit(
+        await safe_edit_message(
+            msg,
             f"❌ Error during soft-mux! (Job: <code>{job_id}</code>)\n\n"
             f"<pre>{err_preview}</pre>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            force=True,
         )
         return False
 
@@ -362,8 +395,14 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, cf
 
     if is_url:
         # ---- NEW: Build yt-dlp + ffmpeg shell command ----
-        yt_dlp_cmd_parts, normalized_url = build_ytdlp_base_command(vid_path)
-        yt_dlp_cmd_parts += ['-o', '-', normalized_url]
+        host = urlparse(vid_path).hostname or ""
+        yt_dlp_cmd_parts = ['yt-dlp', '-o', '-']
+        
+        if "dmcdn.net" in host or "dailymotion.com" in host:
+            logger.info("Applying Dailymotion headers to yt-dlp")
+            yt_dlp_cmd_parts += ["--user-agent", "Mozilla/5.0", "--referer", "https::/www.dailymotion.com"]
+        
+        yt_dlp_cmd_parts.append(vid_path)
         yt_dlp_cmd_str = " ".join([shlex.quote(p) for p in yt_dlp_cmd_parts])
         
         ffmpeg_cmd_parts = [
@@ -373,9 +412,7 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, cf
             '-i', sub_path,    # Read subtitle from file
             '-vf', vf_arg,
             '-pix_fmt', 'yuv420p',
-            '-c:v', codec, '-preset', preset, '-crf', crf,
-            '-map','0:v:0','-map','0:a:0?',
-            '-c:a','copy',
+            '-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'aac', '-b:a', '192k', '-y', out_path,
             '-y', out_path
         ]
         ffmpeg_cmd_str = " ".join([shlex.quote(p) for p in ffmpeg_cmd_parts])
@@ -398,9 +435,7 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, cf
             '-i', sub_path,
             '-vf', vf_arg,
             '-c:v', codec, '-preset', preset, '-crf', crf,
-            '-map','0:v:0','-map','0:a:0?',
-            '-c:a','copy',
-            '-y', out_path,
+            '-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'aac', '-b:a', '192k', '-y', out_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -410,16 +445,23 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, cf
     waiter = asyncio.create_task(proc.wait())
     running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter], 'progress': 'Initializing...', 'filename': final_name}
 
-    await msg.edit(f"🔄 Hard-Mux started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort", parse_mode=ParseMode.HTML)
+    await safe_edit_message(
+        msg,
+        f"🔄 Hard-Mux started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort",
+        parse_mode=ParseMode.HTML,
+        force=True,
+    )
     await asyncio.wait([reader, waiter])
     
     full_stderr_lines = reader.result() or []
     running_jobs.pop(job_id, None)
     
     if proc.returncode == 0:
-        await msg.edit(
+        await safe_edit_message(
+            msg,
             f"✅ Hard-Mux `<code>{job_id}</code>` completed in {round(time.time()-start)}s",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            force=True,
         )
         await asyncio.sleep(2)
         return output
@@ -436,10 +478,12 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str, cf
         logger.error("Hard-mux failed for job %s — tail: %s", job_id, full_stderr_text[-1500:])
         err_preview = full_stderr_text[-1000:] 
         
-        await msg.edit(
+        await safe_edit_message(
+            msg,
             f"❌ Error during hard-mux! (Job: <code>{job_id}</code>)\n\n"
             f"<pre>{err_preview}</pre>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            force=True,
         )
         return False
 # ============ NO-SUB (encode only) ============
@@ -487,8 +531,14 @@ async def nosub_encode(vid_filename: str, msg, job_id: str, cfg: dict, final_nam
         # ---- NEW: Build yt-dlp + ffmpeg shell command ----
         
         # Build the yt-dlp part
-        yt_dlp_cmd_parts, normalized_url = build_ytdlp_base_command(vid_path)
-        yt_dlp_cmd_parts = yt_dlp_cmd_parts + ['-o', '-', normalized_url] # Output to stdout
+        host = urlparse(vid_path).hostname or ""
+        yt_dlp_cmd_parts = ['yt-dlp', '-o', '-'] # Output to stdout
+        
+        if "dmcdn.net" in host or "dailymotion.com" in host:
+            logger.info("Applying Dailymotion headers to yt-dlp")
+            yt_dlp_cmd_parts += ["--user-agent", "Mozilla/5.0", "--referer", "https://www.dailymotion.com"]
+        
+        yt_dlp_cmd_parts.append(vid_path)
         
         # Quote each part for shell safety
         yt_dlp_cmd_str = " ".join([shlex.quote(p) for p in yt_dlp_cmd_parts])
@@ -500,7 +550,7 @@ async def nosub_encode(vid_filename: str, msg, job_id: str, cfg: dict, final_nam
             *vf_args,
             '-pix_fmt', 'yuv420p',
             '-c:v', codec, '-preset', preset, '-crf', crf,
-            '-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'copy',
+            '-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'aac', '-b:a', '192k',
             '-y', out_path
         ]
         ffmpeg_cmd_str = " ".join([shlex.quote(p) for p in ffmpeg_cmd_parts])
@@ -522,7 +572,7 @@ async def nosub_encode(vid_filename: str, msg, job_id: str, cfg: dict, final_nam
         args += [
             '-i', vid_path, *vf_args,
             '-c:v', codec, '-preset', preset, '-crf', crf,
-            '-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'copy',
+            '-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'aac', '-b:a', '192k',
             '-y', out_path
         ]
         
@@ -537,16 +587,23 @@ async def nosub_encode(vid_filename: str, msg, job_id: str, cfg: dict, final_nam
     waiter = asyncio.create_task(proc.wait())
     running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter], 'progress': 'Initializing...', 'filename': final_name}
 
-    await msg.edit(f"🔄 Encode started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort", parse_mode=ParseMode.HTML)
+    await safe_edit_message(
+        msg,
+        f"🔄 Encode started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort",
+        parse_mode=ParseMode.HTML,
+        force=True,
+    )
     await asyncio.wait([reader, waiter])
     
     full_stderr_lines = reader.result() or [] 
     running_jobs.pop(job_id, None)
 
     if proc.returncode == 0:
-        await msg.edit(
+        await safe_edit_message(
+            msg,
             f"✅ Encode `<code>{job_id}</code>` completed in {round(time.time()-start)}s",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            force=True,
         )
         await asyncio.sleep(2)
         return output
@@ -566,10 +623,12 @@ async def nosub_encode(vid_filename: str, msg, job_id: str, cfg: dict, final_nam
         
         err_preview = full_stderr_text[-1000:] 
         
-        await msg.edit(
+        await safe_edit_message(
+            msg,
             f"❌ Error during encode! (Job: <code>{job_id}</code>)\n\n"
             f"<pre>{err_preview}</pre>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            force=True,
         )
         return False
 
@@ -615,7 +674,12 @@ async def split_video(file_path: str, status_msg) -> list:
     if file_size <= limit:
         return [file_path] # No splitting needed
         
-    await status_msg.edit("✂️ <b>File exceeds 2GB!</b> Splitting video into parts...", parse_mode=ParseMode.HTML)
+    await safe_edit_message(
+        status_msg,
+        "✂️ <b>File exceeds 2GB!</b> Splitting video into parts...",
+        parse_mode=ParseMode.HTML,
+        force=True,
+    )
     
     duration = await _probe_duration(file_path)
     if not duration:
